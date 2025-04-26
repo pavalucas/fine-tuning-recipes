@@ -49,24 +49,67 @@ pip install -r requirements/llm.txt
 - Evaluation using NDCG and other metrics
 - Support for multiple embedding models (E5, BGE, etc.)
 
-### LLM Models
-- Dataset preparation for instruction fine-tuning
-- Support for different fine-tuning approaches (LoRA, QLoRA, etc.)
-- Evaluation metrics for LLM performance
-- Support for various LLM architectures
+#### Usage Examples
 
-## References
+1. Create training and test datasets:
+```bash
+# Create training dataset
+python embedding-models/datasets/create_synthetic_dataset.py \
+    --num_samples 1000 \
+    --output_path embedding-models/datasets/embedding_synthetic_training_dataset.csv
 
-### Embedding Models
-- [Fine-tune Embedding Model for RAG](https://www.philschmid.de/fine-tune-embedding-model-for-rag)
-- [Enhancing Arabic Text Understanding in RAG Models](https://medium.com/@alroumi.abdulmajeed/enhancing-arabic-text-understanding-in-rag-models-through-fine-tuning-embeddings-bede568d66aa)
-- [GATE: A Challenge Set for Gender-Ambiguous Translation Examples](https://arxiv.org/abs/2402.05672)
+# Create test dataset
+python embedding-models/datasets/create_synthetic_dataset.py \
+    --num_samples 200 \
+    --output_path embedding-models/datasets/embedding_synthetic_test_dataset.csv
+```
 
-### LLM Models
-- [Parameter-Efficient Fine-Tuning (PEFT)](https://huggingface.co/docs/peft/index)
-- [QLoRA: Efficient Finetuning of Quantized LLMs](https://arxiv.org/abs/2305.14314)
-- [LoRA: Low-Rank Adaptation of Large Language Models](https://arxiv.org/abs/2106.09685)
+2. Train an embedding model:
+```bash
+python embedding-models/models/train.py \
+    --model sentence-transformers/all-MiniLM-L6-v2 \
+    --train_dataset_path embedding-models/datasets/embedding_synthetic_training_dataset.csv \
+    --output_dir models/all-MiniLM-L6-v2 \
+    --batch_size 32 \
+    --epochs 3 \
+    --learning_rate 2e-5 \
+    --warmup_steps 100 \
+    --evaluation_steps 100 \
+    --use_wandb \
+    --wandb_project embedding-fine-tuning
+```
 
-## License
+3. Evaluate the trained model on the test set:
+```bash
+python embedding-models/models/evaluate.py \
+    --model models/all-MiniLM-L6-v2 \
+    --test_dataset_path embedding-models/datasets/embedding_synthetic_test_dataset.csv \
+    --batch_size 32
+```
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+Complete workflow example:
+```bash
+# 1. Create datasets
+python embedding-models/datasets/create_synthetic_dataset.py --num_samples 1000 --output_path embedding-models/datasets/embedding_synthetic_training_dataset.csv
+python embedding-models/datasets/create_synthetic_dataset.py --num_samples 200 --output_path embedding-models/datasets/embedding_synthetic_test_dataset.csv
+
+# 2. Train the model
+python embedding-models/models/train.py \
+    --model sentence-transformers/all-MiniLM-L6-v2 \
+    --train_dataset_path embedding-models/datasets/embedding_synthetic_training_dataset.csv \
+    --output_dir models/all-MiniLM-L6-v2 \
+    --batch_size 32 \
+    --epochs 3 \
+    --use_wandb
+
+# 3. Evaluate on test set
+python embedding-models/models/evaluate.py \
+    --model models/all-MiniLM-L6-v2 \
+    --test_dataset_path embedding-models/datasets/embedding_synthetic_test_dataset.csv \
+    --batch_size 32
+```
+
+The scripts will:
+1. Create synthetic datasets for both training and testing
+2. Train a model using the training dataset with the specified parameters
+3. Evaluate the model's performance on the test set using NDCG and other metrics
