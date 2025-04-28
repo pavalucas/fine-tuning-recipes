@@ -17,6 +17,7 @@ import numpy as np
 from sentence_transformers import util
 from sklearn.metrics import accuracy_score
 import argparse
+from datasets import load_dataset
 
 # Configure logging
 logging.basicConfig(
@@ -47,20 +48,113 @@ def initialize_wandb(project_name: str, config: Dict) -> Optional[wandb.sdk.wand
         logging.error(f"Failed to initialize Weights & Biases: {str(e)}")
         return None
 
-def load_dataset(csv_path: Union[str, Path]) -> List[InputExample]:
-    """Load the dataset from CSV and convert to InputExamples."""
-    logging.info(f"Loading dataset from {csv_path}")
-    df = pd.read_csv(csv_path)
-    logging.info(f"Dataset loaded with {len(df)} rows")
+def load_dataset_from_source(
+    dataset_source: str,
+    split: str = "train",
+    triplet_columns: str = "anchor,positive,negative",
+    pair_columns: str = "anchor,positive"
+) -> List[InputExample]:
+    """Load dataset from either a local CSV file or Hugging Face dataset.
     
-    examples = []
-    for _, row in df.iterrows():
-        examples.append(InputExample(
-            texts=[row['query'], row['positive_doc'], row['negative_doc']],
-            label=1.0  # Positive example
-        ))
+    Args:
+        dataset_source: Either a path to a local CSV file or a Hugging Face dataset name
+                       For Hugging Face datasets that require a config, use format: dataset_name:config_name
+        split: Dataset split to use (train/test/validation)
+        triplet_columns: Comma-separated column names for triplet format in order: anchor,positive,negative
+                        Default: "anchor,positive,negative"
+        pair_columns: Comma-separated column names for pair format in order: anchor,positive
+                     Default: "anchor,positive"
     
-    logging.info(f"Converted {len(examples)} examples to InputExamples")
+    Returns:
+        List of InputExample objects
+    """
+    # Split column names
+    triplet_cols = [col.strip() for col in triplet_columns.split(',')]
+    pair_cols = [col.strip() for col in pair_columns.split(',')]
+    
+    logging.info(f"Loading dataset from source: {dataset_source}")
+    
+    # Check if the source is a local file
+    if os.path.exists(dataset_source):
+        logging.info("Loading from local CSV file")
+        df = pd.read_csv(dataset_source)
+        examples = []
+        
+        # Check if we have all required columns for triplet format
+        if all(col in df.columns for col in triplet_cols):
+            for _, row in df.iterrows():
+                examples.append(InputExample(
+                    texts=[
+                        row[triplet_cols[0]],  # anchor
+                        row[triplet_cols[1]],  # positive
+                        row[triplet_cols[2]]   # negative
+                    ],
+                    label=1.0
+                ))
+        # Check if we have all required columns for pair format
+        elif all(col in df.columns for col in pair_cols):
+            for _, row in df.iterrows():
+                examples.append(InputExample(
+                    texts=[
+                        row[pair_cols[0]],  # anchor
+                        row[pair_cols[1]]   # positive
+                    ],
+                    label=1.0
+                ))
+        else:
+            raise ValueError(
+                f"Dataset must contain either triplet columns ({triplet_cols}) "
+                f"or pair columns ({pair_cols})"
+            )
+    else:
+        # Try to load from Hugging Face
+        logging.info("Loading from Hugging Face dataset")
+        try:
+            # Check if dataset source includes a config
+            if ':' in dataset_source:
+                dataset_name, config_name = dataset_source.split(':')
+                dataset = load_dataset(dataset_name, config_name, split=split)
+            else:
+                dataset = load_dataset(dataset_source, split=split)
+            
+            examples = []
+            # Check if we have all required columns for triplet format
+            if all(col in dataset.features for col in triplet_cols):
+                for item in dataset:
+                    examples.append(InputExample(
+                        texts=[
+                            item[triplet_cols[0]],  # anchor
+                            item[triplet_cols[1]],  # positive
+                            item[triplet_cols[2]]   # negative
+                        ],
+                        label=1.0
+                    ))
+            # Check if we have all required columns for pair format
+            elif all(col in dataset.features for col in pair_cols):
+                for item in dataset:
+                    examples.append(InputExample(
+                        texts=[
+                            item[pair_cols[0]],  # anchor
+                            item[pair_cols[1]]   # positive
+                        ],
+                        label=1.0
+                    ))
+            else:
+                raise ValueError(
+                    f"Dataset must contain either triplet columns ({triplet_cols}) "
+                    f"or pair columns ({pair_cols})"
+                )
+        except Exception as e:
+            if 'Config name is missing' in str(e):
+                available_configs = str(e).split('available configs: ')[1].split('\n')[0]
+                raise ValueError(
+                    f"Dataset {dataset_source} requires a configuration. "
+                    f"Available configs: {available_configs}. "
+                    f"Please specify the config using format: dataset_name:config_name"
+                )
+            raise ValueError(f"Failed to load dataset from {dataset_source}. Error: {str(e)}")
+    
+    logging.info(f"Loaded {len(examples)} examples")
     return examples
 
 def evaluate_model(model, examples, batch_size=16):
@@ -118,8 +212,8 @@ def evaluate_model(model, examples, batch_size=16):
 
 def train_embedding_model(
     model_name: str,
-    train_dataset_path: Union[str, Path],
-    output_dir: Union[str, Path],
+    dataset_source: str,
+    output_dir: str,
     batch_size: int = 32,
     epochs: int = 3,
     learning_rate: float = 2e-5,
@@ -127,14 +221,16 @@ def train_embedding_model(
     evaluation_steps: int = 100,
     use_wandb: bool = True,
     device: Optional[str] = None,
-    wandb_project: str = "embedding-fine-tuning"
+    wandb_project: str = "embedding-fine-tuning",
+    triplet_columns: str = "anchor,positive,negative",
+    pair_columns: str = "anchor,positive"
 ) -> SentenceTransformer:
     """
     Train an embedding model using SentenceTransformers.
     
     Args:
         model_name: Name of the base model from HuggingFace
-        train_dataset_path: Path to the training dataset CSV
+        dataset_source: Either a path to a local CSV file or a Hugging Face dataset name
         output_dir: Directory to save the trained model
         batch_size: Training batch size
         epochs: Number of training epochs
@@ -144,9 +240,8 @@ def train_embedding_model(
         use_wandb: Whether to use Weights & Biases for logging
         device: Device to use for training (cuda/cpu)
         wandb_project: Weights & Biases project name
-        
-    Returns:
-        SentenceTransformer: Trained model
+        triplet_columns: Comma-separated column names for triplet format in order: anchor,positive,negative
+        pair_columns: Comma-separated column names for pair format in order: anchor,positive
     """
     logging.info(f"Starting training with model: {model_name}")
     
@@ -163,6 +258,9 @@ def train_embedding_model(
             "epochs": epochs,
             "learning_rate": learning_rate,
             "warmup_steps": warmup_steps,
+            "dataset_source": dataset_source,
+            "triplet_columns": triplet_columns,
+            "pair_columns": pair_columns
         }
         wandb_run = initialize_wandb(wandb_project, config)
         if wandb_run is None:
@@ -170,7 +268,12 @@ def train_embedding_model(
             use_wandb = False
     
     # Load the dataset
-    train_examples = load_dataset(train_dataset_path)
+    train_examples = load_dataset_from_source(
+        dataset_source,
+        split="train",
+        triplet_columns=triplet_columns,
+        pair_columns=pair_columns
+    )
     
     # Split into train and validation sets (80/20)
     train_size = int(0.8 * len(train_examples))
@@ -189,8 +292,8 @@ def train_embedding_model(
         batch_size=batch_size
     )
     
-    # Define loss function (TripletLoss for triplets)
-    train_loss = losses.TripletLoss(model=model)
+    # Define loss function (MultipleNegativesRankingLoss for triplets)
+    train_loss = losses.MultipleNegativesRankingLoss(model=model)
     
     # Create evaluator
     evaluator = evaluation.TripletEvaluator(
@@ -202,6 +305,17 @@ def train_embedding_model(
     
     # Train the model
     logging.info("Starting training...")
+    
+    # Define callback for logging training loss
+    def log_callback(score, epoch, steps, loss):
+        if use_wandb and wandb_run:
+            wandb.log({
+                "eval_score": score,
+                "train_loss": loss,
+                "epoch": epoch,
+                "steps": steps
+            })
+    
     model.fit(
         train_objectives=[(train_dataloader, train_loss)],
         epochs=epochs,
@@ -211,7 +325,7 @@ def train_embedding_model(
         show_progress_bar=True,
         evaluator=evaluator,
         evaluation_steps=evaluation_steps,
-        callback=lambda score, epoch, steps: wandb.log({"eval_score": score}) if use_wandb and wandb_run else None
+        callback=log_callback
     )
     
     # Final evaluation
@@ -271,12 +385,12 @@ def main():
     parser = argparse.ArgumentParser(description='Train an embedding model')
     parser.add_argument('--model', type=str, default='sentence-transformers/all-MiniLM-L6-v2',
                       help='Name of the base model from HuggingFace (default: sentence-transformers/all-MiniLM-L6-v2)')
-    parser.add_argument('--train_dataset_path', type=str, default='embedding-models/datasets/embedding_training_dataset_100.csv',
-                      help='Path to the training dataset CSV (default: embedding-models/datasets/embedding_training_dataset_100.csv)')
+    parser.add_argument('--dataset_source', type=str, required=True,
+                      help='Either a path to a local CSV file or a Hugging Face dataset name')
     parser.add_argument('--output_dir', type=str, default='models/all-MiniLM-L6-v2',
                       help='Directory to save the trained model (default: models/all-MiniLM-L6-v2)')
-    parser.add_argument('--batch_size', type=int, default=16,
-                      help='Training batch size (default: 16)')
+    parser.add_argument('--batch_size', type=int, default=32,
+                      help='Training batch size (default: 32)')
     parser.add_argument('--epochs', type=int, default=3,
                       help='Number of training epochs (default: 3)')
     parser.add_argument('--learning_rate', type=float, default=2e-5,
@@ -291,22 +405,16 @@ def main():
                       help='Device to use for training (cuda/cpu)')
     parser.add_argument('--wandb_project', type=str, default='embedding-fine-tuning',
                       help='Weights & Biases project name (default: embedding-fine-tuning)')
+    parser.add_argument('--triplet_columns', type=str, default="anchor,positive,negative",
+                      help='Comma-separated column names for triplet format in order: anchor,positive,negative (default: anchor,positive,negative)')
+    parser.add_argument('--pair_columns', type=str, default="anchor,positive",
+                      help='Comma-separated column names for pair format in order: anchor,positive (default: anchor,positive)')
     args = parser.parse_args()
     
-    # Load validation data
-    val_data = load_dataset(args.train_dataset_path)
-    train_size = int(0.8 * len(val_data))
-    val_data = val_data[train_size:]
-    
-    # Initialize baseline model
-    logging.info(f"Initializing baseline model: {args.model}")
-    baseline_model = SentenceTransformer(args.model)
-    
-    # Train fine-tuned model
-    logging.info("Training fine-tuned model...")
-    fine_tuned_model = train_embedding_model(
+    # Train the model
+    model = train_embedding_model(
         model_name=args.model,
-        train_dataset_path=args.train_dataset_path,
+        dataset_source=args.dataset_source,
         output_dir=args.output_dir,
         batch_size=args.batch_size,
         epochs=args.epochs,
@@ -315,24 +423,10 @@ def main():
         evaluation_steps=args.evaluation_steps,
         use_wandb=args.use_wandb,
         device=args.device,
-        wandb_project=args.wandb_project
+        wandb_project=args.wandb_project,
+        triplet_columns=args.triplet_columns,
+        pair_columns=args.pair_columns
     )
-    
-    # Compare models
-    comparison = compare_models(baseline_model, fine_tuned_model, val_data)
-    
-    # Log to wandb if available
-    if wandb.run is not None:
-        wandb.log({
-            'baseline_accuracy': comparison['baseline']['accuracy'],
-            'baseline_ndcg': comparison['baseline']['ndcg'],
-            'baseline_avg_pos_sim': comparison['baseline']['avg_pos_sim'],
-            'baseline_avg_neg_sim': comparison['baseline']['avg_neg_sim'],
-            'improvement_accuracy': comparison['improvements']['accuracy'],
-            'improvement_ndcg': comparison['improvements']['ndcg'],
-            'improvement_avg_pos_sim': comparison['improvements']['avg_pos_sim'],
-            'improvement_avg_neg_sim': comparison['improvements']['avg_neg_sim']
-        })
 
 if __name__ == "__main__":
     main() 

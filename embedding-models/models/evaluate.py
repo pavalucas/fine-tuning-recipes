@@ -1,13 +1,13 @@
 import os
-from pathlib import Path
-from typing import Optional, Union, List
-from sentence_transformers import SentenceTransformer, evaluation
+import logging
 import pandas as pd
 import torch
-import numpy as np
-from sklearn.metrics import ndcg_score
+from sentence_transformers import SentenceTransformer, InputExample, evaluation
+from datasets import load_dataset
+from typing import List, Optional, Union
+from pathlib import Path
 import argparse
-import logging
+import json
 
 # Configure logging
 logging.basicConfig(
@@ -15,20 +15,135 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
-def evaluate_model(
-    model: Union[str, SentenceTransformer],
-    test_dataset_path: Union[str, Path],
-    batch_size: int = 32,
-    device: Optional[str] = None
-) -> dict:
-    """
-    Evaluate an embedding model using NDCG and other metrics.
+def load_dataset_from_source(
+    dataset_source: str,
+    split: str = "test",
+    triplet_columns: str = "anchor,positive,negative",
+    pair_columns: str = "anchor,positive"
+) -> List[InputExample]:
+    """Load dataset from either a local CSV file or Hugging Face dataset.
     
     Args:
-        model: Either a model name or a SentenceTransformer instance
-        test_dataset_path: Path to the test dataset CSV file
+        dataset_source: Either a path to a local CSV file or a Hugging Face dataset name
+                       For Hugging Face datasets that require a config, use format: dataset_name:config_name
+        split: Dataset split to use (train/test/validation)
+        triplet_columns: Comma-separated column names for triplet format in order: anchor,positive,negative
+                        Default: "anchor,positive,negative"
+        pair_columns: Comma-separated column names for pair format in order: anchor,positive
+                     Default: "anchor,positive"
+    
+    Returns:
+        List of InputExample objects
+    """
+    # Split column names
+    triplet_cols = [col.strip() for col in triplet_columns.split(',')]
+    pair_cols = [col.strip() for col in pair_columns.split(',')]
+    
+    logging.info(f"Loading dataset from source: {dataset_source}")
+    
+    # Check if the source is a local file
+    if os.path.exists(dataset_source):
+        logging.info("Loading from local CSV file")
+        df = pd.read_csv(dataset_source)
+        examples = []
+        
+        # Check if we have all required columns for triplet format
+        if all(col in df.columns for col in triplet_cols):
+            for _, row in df.iterrows():
+                examples.append(InputExample(
+                    texts=[
+                        row[triplet_cols[0]],  # anchor
+                        row[triplet_cols[1]],  # positive
+                        row[triplet_cols[2]]   # negative
+                    ],
+                    label=1.0
+                ))
+        # Check if we have all required columns for pair format
+        elif all(col in df.columns for col in pair_cols):
+            for _, row in df.iterrows():
+                examples.append(InputExample(
+                    texts=[
+                        row[pair_cols[0]],  # anchor
+                        row[pair_cols[1]]   # positive
+                    ],
+                    label=1.0
+                ))
+        else:
+            raise ValueError(
+                f"Dataset must contain either triplet columns ({triplet_cols}) "
+                f"or pair columns ({pair_cols})"
+            )
+    else:
+        # Try to load from Hugging Face
+        logging.info("Loading from Hugging Face dataset")
+        try:
+            # Check if dataset source includes a config
+            if ':' in dataset_source:
+                dataset_name, config_name = dataset_source.split(':')
+                dataset = load_dataset(dataset_name, config_name, split=split)
+            else:
+                dataset = load_dataset(dataset_source, split=split)
+            
+            examples = []
+            # Check if we have all required columns for triplet format
+            if all(col in dataset.features for col in triplet_cols):
+                for item in dataset:
+                    examples.append(InputExample(
+                        texts=[
+                            item[triplet_cols[0]],  # anchor
+                            item[triplet_cols[1]],  # positive
+                            item[triplet_cols[2]]   # negative
+                        ],
+                        label=1.0
+                    ))
+            # Check if we have all required columns for pair format
+            elif all(col in dataset.features for col in pair_cols):
+                for item in dataset:
+                    examples.append(InputExample(
+                        texts=[
+                            item[pair_cols[0]],  # anchor
+                            item[pair_cols[1]]   # positive
+                        ],
+                        label=1.0
+                    ))
+            else:
+                raise ValueError(
+                    f"Dataset must contain either triplet columns ({triplet_cols}) "
+                    f"or pair columns ({pair_cols})"
+                )
+        except Exception as e:
+            if 'Config name is missing' in str(e):
+                available_configs = str(e).split('available configs: ')[1].split('\n')[0]
+                raise ValueError(
+                    f"Dataset {dataset_source} requires a configuration. "
+                    f"Available configs: {available_configs}. "
+                    f"Please specify the config using format: dataset_name:config_name"
+                )
+            raise ValueError(f"Failed to load dataset from {dataset_source}. Error: {str(e)}")
+    
+    logging.info(f"Loaded {len(examples)} examples")
+    return examples
+
+def evaluate_model(
+    model: Union[str, Path],
+    dataset_source: str,
+    batch_size: int = 32,
+    device: Optional[str] = None,
+    triplet_columns: str = "anchor,positive,negative",
+    pair_columns: str = "anchor,positive"
+) -> dict:
+    """
+    Evaluate a trained embedding model.
+    
+    Args:
+        model: Path to the trained model or model name
+        dataset_source: Either a path to a local CSV file or a Hugging Face dataset name
         batch_size: Evaluation batch size
         device: Device to use for evaluation (cuda/cpu)
+        triplet_columns: Comma-separated column names for triplet format in order: anchor,positive,negative
+                        Default: "anchor,positive,negative"
+        pair_columns: Comma-separated column names for pair format in order: anchor,positive
+                     Default: "anchor,positive"
         
     Returns:
         dict: Dictionary containing evaluation metrics
@@ -37,55 +152,29 @@ def evaluate_model(
         device = "cuda" if torch.cuda.is_available() else "cpu"
         logging.info(f"Using device: {device}")
     
-    # Load or initialize the model
-    if isinstance(model, str):
-        logging.info(f"Loading model: {model}")
-        model = SentenceTransformer(model, device=device)
+    # Load the model
+    logging.info(f"Loading model from {model}")
+    model = SentenceTransformer(str(model), device=device)
     
     # Load the test dataset
-    logging.info(f"Loading test dataset from {test_dataset_path}")
-    test_df = pd.read_csv(test_dataset_path)
-    logging.info(f"Loaded {len(test_df)} test examples")
+    test_examples = load_dataset_from_source(
+        dataset_source,
+        split="test",
+        triplet_columns=triplet_columns,
+        pair_columns=pair_columns
+    )
     
-    # Prepare evaluation data
-    queries = test_df["query"].tolist()
-    positive_docs = test_df["positive_doc"].tolist()
-    negative_docs = test_df["negative_doc"].tolist()
+    # Create evaluator
+    evaluator = evaluation.TripletEvaluator(
+        anchors=[ex.texts[0] for ex in test_examples],
+        positives=[ex.texts[1] for ex in test_examples],
+        negatives=[ex.texts[2] for ex in test_examples],
+        name='test'
+    )
     
-    # Compute embeddings
-    logging.info("Computing embeddings...")
-    query_embeddings = model.encode(queries, batch_size=batch_size, show_progress_bar=True)
-    pos_embeddings = model.encode(positive_docs, batch_size=batch_size, show_progress_bar=True)
-    neg_embeddings = model.encode(negative_docs, batch_size=batch_size, show_progress_bar=True)
-    
-    # Calculate similarities
-    logging.info("Calculating similarities...")
-    pos_similarities = []
-    neg_similarities = []
-    
-    for i in range(len(queries)):
-        pos_sim = np.dot(query_embeddings[i], pos_embeddings[i])
-        neg_sim = np.dot(query_embeddings[i], neg_embeddings[i])
-        pos_similarities.append(pos_sim)
-        neg_similarities.append(neg_sim)
-    
-    # Calculate metrics
-    logging.info("Computing metrics...")
-    accuracy = np.mean([1 if pos > neg else 0 for pos, neg in zip(pos_similarities, neg_similarities)])
-    avg_pos_sim = np.mean(pos_similarities)
-    avg_neg_sim = np.mean(neg_similarities)
-    
-    # Calculate NDCG
-    y_true = np.array([[1, 0] for _ in range(len(queries))])
-    y_score = np.array([[pos, neg] for pos, neg in zip(pos_similarities, neg_similarities)])
-    ndcg = ndcg_score(y_true, y_score)
-    
-    metrics = {
-        'accuracy': accuracy,
-        'ndcg': ndcg,
-        'avg_pos_sim': avg_pos_sim,
-        'avg_neg_sim': avg_neg_sim
-    }
+    # Run evaluation
+    logging.info("Starting evaluation...")
+    metrics = evaluator(model)
     
     logging.info("Evaluation metrics:")
     for metric, value in metrics.items():
@@ -93,27 +182,34 @@ def evaluate_model(
     
     return metrics
 
-if __name__ == "__main__":
-    # Set up argument parser
+def main():
     parser = argparse.ArgumentParser(description='Evaluate an embedding model')
-    parser.add_argument('--model', type=str, default='sentence-transformers/all-MiniLM-L6-v2',
-                      help='Name of the model from HuggingFace (default: sentence-transformers/all-MiniLM-L6-v2)')
-    parser.add_argument('--test_dataset_path', type=str, default='embedding-models/datasets/embedding_synthetic_test_dataset.csv',
-                      help='Path to the test dataset CSV (default: embedding-models/datasets/embedding_synthetic_test_dataset.csv)')
+    parser.add_argument('--model', type=str, required=True,
+                      help='Path to the trained model or model name')
+    parser.add_argument('--dataset_source', type=str, required=True,
+                      help='Either a path to a local CSV file or a Hugging Face dataset name')
     parser.add_argument('--batch_size', type=int, default=32,
                       help='Evaluation batch size (default: 32)')
     parser.add_argument('--device', type=str, default=None,
                       help='Device to use for evaluation (cuda/cpu)')
+    parser.add_argument('--triplet_columns', type=str, default="anchor,positive,negative",
+                      help='Comma-separated column names for triplet format in order: anchor,positive,negative (default: anchor,positive,negative)')
+    parser.add_argument('--pair_columns', type=str, default="anchor,positive",
+                      help='Comma-separated column names for pair format in order: anchor,positive (default: anchor,positive)')
     args = parser.parse_args()
     
-    # Run evaluation
     metrics = evaluate_model(
         model=args.model,
-        test_dataset_path=args.test_dataset_path,
+        dataset_source=args.dataset_source,
         batch_size=args.batch_size,
-        device=args.device
+        device=args.device,
+        triplet_columns=args.triplet_columns,
+        pair_columns=args.pair_columns
     )
     
-    print("\nFinal Evaluation Metrics:")
+    print("\nEvaluation Metrics:")
     for metric, value in metrics.items():
-        print(f"{metric}: {value:.4f}") 
+        print(f"{metric}: {value:.4f}")
+
+if __name__ == "__main__":
+    main() 
